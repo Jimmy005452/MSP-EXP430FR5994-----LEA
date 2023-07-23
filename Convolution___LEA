@@ -1,0 +1,360 @@
+/* --COPYRIGHT--,BSD
+ * Copyright (c) 2017, Texas Instruments Incorporated
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * *  Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * *  Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * *  Neither the name of Texas Instruments Incorporated nor the names of
+ *    its contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+ * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * --/COPYRIGHT--*/
+//******************************************************************************
+// Add two real 16-bit matrices.
+//
+//! \example matrix_ex1_add_q15.c
+//! This example demonstrates how to use the msp_matrix_add_q15 API to perform
+//! addition of two real source matrices.
+//!
+// Brent Peterson, Jeremy Friesenhahn
+// Texas Instruments Inc.
+// April 2016
+//******************************************************************************
+#include "msp430.h"
+
+#include "grlib.h"
+#include "LcdDriver/Sharp128x128.h"
+#include "images/images.h"
+#include "driverlib//MSP430FR5xx_6xx//driverlib.h"
+#include "stdint.h"
+
+#include "UseLCD.h"
+
+#include <math.h>
+#include <stdbool.h>
+
+#include "DSPLib.h"
+
+#include <time.h>
+#include <stdlib.h>
+
+//-----------------------------------------------------------------------
+Graphics_Context g_sContext;
+uint8_t g_delayCounter = 0;
+
+#if defined(__IAR_SYSTEMS_ICC__)
+int16_t __low_level_init(void) {
+    // Stop WDT (Watch Dog Timer)
+    WDTCTL = WDTPW + WDTHOLD;
+    return(1);
+}
+#endif
+
+char *numbers = "0123456789ABCDEF";
+//-----------------------------------------------------------------------
+const int IMAGESIZE = 32;
+const int CHANNEL = 1;
+
+const int depth = 6;
+const int strike = 1;
+const int kernelSize = 5;
+const int outputSize = IMAGESIZE - kernelSize + 1;
+
+#pragma PERSISTENT(image)
+_q15 image[1][IMAGESIZE][IMAGESIZE][CHANNEL] = {0};
+
+DSPLIB_DATA(temp,4)
+_q15 temp[kernelSize][kernelSize + 1] = {0};
+
+DSPLIB_DATA(filter,4)
+_q15 filter[depth][kernelSize][kernelSize + 1][CHANNEL] = {0};
+
+#pragma PERSISTENT(output)
+_q15 output[depth][outputSize][outputSize][CHANNEL] = {0};
+
+//-----------------------------------------------------------------------
+/* Input parameters */
+#define SIGNAL_ROWS         kernelSize
+#define SIGNAL_COLS         (kernelSize + 1)
+
+/* Input matrix A */
+DSPLIB_DATA(inputA,4)
+_q15 inputA[SIGNAL_ROWS][SIGNAL_COLS];
+
+/* Input matrix B */
+DSPLIB_DATA(inputB,4)
+_q15 inputB[SIGNAL_ROWS][SIGNAL_COLS];
+
+/* Result of the matrix add */
+DSPLIB_DATA(result,4)
+_q15 result[SIGNAL_ROWS][SIGNAL_COLS];
+
+DSPLIB_DATA(resultForMac,8)
+_iq31 resultForMac[1][1];
+
+//-----------------------------------------------------------------------
+
+/* Benchmark cycle counts */
+volatile uint32_t cycleCount;
+
+void main(void)
+{
+    //-----------------------------------------------------------------------
+    uint16_t gie;
+
+    boardInit();
+    clockInit();
+
+    // Set up the LCD
+    Sharp128x128_initDisplay();
+
+    /*
+     * Disable the GPIO power-on default high-impedance mode to activate
+     * previously configured port settings
+     */
+
+    PMM_unlockLPM5();
+
+    __enable_interrupt();
+
+    Graphics_initContext(&g_sContext, &g_sharp128x128LCD);
+    Graphics_setForegroundColor(&g_sContext, ClrBlack);
+    Graphics_setBackgroundColor(&g_sContext, ClrWhite);
+    Graphics_setFont(&g_sContext, &g_sFontFixed6x8);
+    Graphics_clearDisplay(&g_sContext);
+    // Store current GIE state
+    gie = __get_SR_register() & GIE;
+    __disable_interrupt();
+    // Flush Buffer to LCD
+    Graphics_flushBuffer(&g_sContext);
+    // Restore original GIE state
+    __bis_SR_register(gie);
+
+    //-----------------------------------------------------------------------
+    srand(time(NULL));
+    //Initial image
+    int i;
+    for (i = 0; i < IMAGESIZE; i++)
+    {
+        int j;
+        for (j = 0; j < IMAGESIZE; j++)
+        {
+            int k;
+            for (k = 0; k < CHANNEL; k++)
+            {
+                image[0][i][j][k] = rand() % 0xFFFF;
+            }
+        }
+    }
+    image[0][0][1][0] = 0x0040;
+
+    //Initial filter
+    int d;
+    for(d = 0; d < depth; d++)
+    {
+        int i;
+        for (i = 0; i < kernelSize; i++)
+        {
+            int j;
+            for (j = 0; j < kernelSize + 1; j++)
+            {
+                int k;
+                for (k = 0; k < CHANNEL; k++)
+                {
+                    filter[d][i][j][k] = rand() % 0x8000;
+                }
+            }
+        }
+    }
+
+    //-----------------------------------------------------------------------
+    msp_status status;
+    msp_matrix_add_q15_params addParams;
+    msp_mac_q15_params macParams;
+
+    /* Disable WDT. */
+    WDTCTL = WDTPW + WDTHOLD;
+
+#ifdef __MSP430_HAS_PMM__
+    /* Disable GPIO power-on default high-impedance mode for FRAM devices */
+    PM5CTL0 &= ~LOCKLPM5;
+#endif
+
+    /* Initialize the parameter structure. */
+    addParams.rows = SIGNAL_ROWS;
+    addParams.cols = SIGNAL_COLS;
+    macParams.length = SIGNAL_ROWS * SIGNAL_COLS;
+
+    /* Invoke the msp_matrix_add_q15 API. */
+    msp_benchmarkStart(MSP_BENCHMARK_BASE, 1);
+    status = msp_matrix_add_q15(&addParams, *inputA, *inputB, *result);
+    cycleCount = msp_benchmarkStop(MSP_BENCHMARK_BASE);
+    msp_checkStatus(status);
+
+    //-----------------------------------------------------------------------
+    Graphics_clearDisplay(&g_sContext);
+    //-----------------------------------------------------------------------
+
+    int g;
+    for (g = 0; g < outputSize; g++)
+    {
+        int h;
+        for (h = 0; h < outputSize; h++)
+        {
+            int i;
+            for (i = 0; i < kernelSize; i++)
+            {
+                int j;
+                for (j = 0; j < kernelSize; j++)
+                {
+                    int k;
+                    for (k = 0; k < CHANNEL; k++)
+                    {
+                        temp[i][j] = image[0][i+g][j+h][k];
+                    }
+                }
+            }
+            for (d = 0; d < depth; d++)
+            {
+                AcceleratorLib_msp_mac_q15(&macParams, *temp, *(filter[d]), *resultForMac);
+
+                //Problem: Auto multiply 2 so divide 2
+                resultForMac[0][0] = resultForMac[0][0] >> 16;
+
+                output[d][g][h][0] = resultForMac[0][0];
+            }
+        }
+    }
+
+    //-----------------------------------------------------------------------
+    Graphics_drawStringCentered(&g_sContext,
+                                        "Result:",
+                                        AUTO_STRING_LENGTH,
+                                        48,
+                                        50,
+                                        TRANSPARENT_TEXT);
+            Graphics_drawStringCentered(&g_sContext,
+                                        "0x",
+                                        2,
+                                        80,
+                                        50,
+                                        TRANSPARENT_TEXT);
+            Graphics_drawStringCentered(&g_sContext,
+                                        numbers + (int)((output[0][0][0][0] & 0xF000) >> 12),
+                                        1,
+                                        89,
+                                        50,
+                                        TRANSPARENT_TEXT);
+            Graphics_drawStringCentered(&g_sContext,
+                                        numbers + (int)((output[0][0][0][0] & 0x0F00) >> 8),
+                                        1,
+                                        96,
+                                        50,
+                                        TRANSPARENT_TEXT);
+            Graphics_drawStringCentered(&g_sContext,
+                                        numbers + (int)((output[0][0][0][0] & 0x00F0) >> 4),
+                                        1,
+                                        103,
+                                        50,
+                                        TRANSPARENT_TEXT);
+            Graphics_drawStringCentered(&g_sContext,
+                                        numbers + (int)((output[0][0][0][0] & 0x000F)),
+                                        1,
+                                        110,
+                                        50,
+                                        TRANSPARENT_TEXT);
+
+    // Store current GIE state
+    gie = __get_SR_register() & GIE;
+    __disable_interrupt();
+    // Flush Buffer to LCD
+    Graphics_flushBuffer(&g_sContext);
+    // Restore original GIE state
+    __bis_SR_register(gie);
+
+    __bis_SR_register(LPM3_bits | GIE);     // Enter LPM3 mode w/ interrupts enabled
+    //-----------------------------------------------------------------------
+
+    /* End of program. */
+    __no_operation();
+}
+
+void AcceleratorLib_msp_mac_q15 ( const msp_mac_q15_params *params, const _q15 *srcA, const _q15 *srcB, _iq31 *result )
+{
+    /* Failure checker */
+    while( LEACNF1 & LEABUSY__BUSY )                __no_operation();                       // wait the LEA
+
+    uint16_t length;
+    MSP_LEA_MAC_PARAMS *leaParams;
+
+    /* Initialize the loop counter with the vector length. */
+    length = params->length;
+
+    /* Allocate MSP_LEA_MAC_PARAMS structure. */
+    leaParams = (MSP_LEA_MAC_PARAMS *)msp_lea_allocMemory(sizeof(MSP_LEA_MAC_PARAMS)/sizeof(uint32_t));
+
+    /* Set MSP_LEA_MAC_PARAMS structure. */
+    leaParams->input2 = MSP_LEA_CONVERT_ADDRESS(srcB);
+    leaParams->output = MSP_LEA_CONVERT_ADDRESS(result);
+    leaParams->vectorSize = length;
+
+    /* Load source arguments to LEA. */
+    LEAPMS0 = MSP_LEA_CONVERT_ADDRESS(srcA);
+    LEAPMS1 = MSP_LEA_CONVERT_ADDRESS(leaParams);
+
+    /* Invoke the LEACMD__MAC command. */
+    msp_lea_ifg = 0;
+    LEAPMCB = LEACMD__MAC | LEAITFLG1;        //LEAITFLG1: LEA interrupt pending
+    while(!msp_lea_ifg) __bis_SR_register( LPM0_bits + GIE );                      //if want to reduce the energy consumption, it can loop in LPM
+
+    /* Free MSP_LEA_MAC_PARAMS structure. */
+    msp_lea_freeMemory(sizeof(MSP_LEA_MAC_PARAMS)/sizeof(uint32_t));
+}
+
+//------------------------------------------------------------------------------
+// Timer1 A1 Interrupt Service Routine. This ISR id use to generate delay on
+// LCD before changing screen content. The ISR is triggered every 500 msec.
+//------------------------------------------------------------------------------
+#pragma vector=TIMER1_A1_VECTOR
+__interrupt void TIMER1_A1_ISR(void)
+{
+    g_delayCounter++;
+
+    // Add Offset to TACCR0
+    Timer_A_setCompareValue(TIMER_A1_BASE,
+                            TIMER_A_CAPTURECOMPARE_REGISTER_1,
+                            Timer_A_getCaptureCompareCount(
+                                TIMER_A1_BASE,
+                                TIMER_A_CAPTURECOMPARE_REGISTER_1) + (12500));          //調整時間
+
+    // If 5 seconds have elapsed, exit LPM0 mode
+    if(g_delayCounter == 10)
+    {
+        __bic_SR_register_on_exit(LPM0_bits);
+    }
+
+    Timer_A_clearCaptureCompareInterrupt(TIMER_A1_BASE,
+                                         TIMER_A_CAPTURECOMPARE_REGISTER_1);
+
+    Timer_A_clearTimerInterrupt(TIMER_A1_BASE);
+}
